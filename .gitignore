@@ -1,6 +1,10 @@
 # Jupyter
 .ipynb_checkpoints/
 
+# Data
+data/processed/
+data/raw/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -13,3 +17,5 @@ env/
 .DS_Store
 Thumbs.db
 .env
+.temp
+
