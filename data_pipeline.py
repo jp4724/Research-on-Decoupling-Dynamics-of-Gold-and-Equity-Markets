@@ -13,7 +13,7 @@ import pandas as pd
 import yfinance as yf
 
 from settings import DATA_RANGE_END, DATA_RANGE_START, get_download_start, get_yfinance_end_exclusive
-from utility_func import DATA_PROCESSED_DIR, DATA_RAW_DIR, ROOT, fetch_fred_series
+from utility_func import DATA_PROCESSED_DIR, DATA_RAW_DIR, ROOT, fetch_fred_series, _fit_egarch_vol
 
 __all__ = [
     "ROOT",
@@ -245,6 +245,8 @@ def build_hmm_feature_csv() -> Path:
     )
 
     out = DATA_PROCESSED_DIR / HMM_FEATURES_CSV
+    features_df["gold_egarch_vol"]   = _fit_egarch_vol(features_df["gold_log_ret"])
+    features_df["sp500_egarch_vol"]  = _fit_egarch_vol(features_df["sp500_log_ret"])    
     features_df.to_csv(out, index=False)
     return out
 

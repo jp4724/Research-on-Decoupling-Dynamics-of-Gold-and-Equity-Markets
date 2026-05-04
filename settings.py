@@ -9,10 +9,10 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 # First calendar day of the sample (inclusive for daily bars).
-DATA_RANGE_START: date = date(2006, 4, 7)
+DATA_RANGE_START: date = date(2006, 2, 6)
 
 # Last calendar day of the sample (inclusive). Use None to use the run time as the end.
-DATA_RANGE_END: date = date(2026, 4, 7)
+DATA_RANGE_END: date = date(2026, 2, 6)
 
 
 def get_download_start() -> datetime:

@@ -19,6 +19,7 @@ import urllib.request
 from dotenv import load_dotenv
 from hmmlearn.hmm import GaussianHMM
 from sklearn.preprocessing import StandardScaler
+from arch import arch_model
 
 load_dotenv()
 FRED_API_KEY = os.getenv("FRED_API_KEY", "").strip("'").strip('"')
@@ -453,6 +454,8 @@ DEFAULT_HMM_FEATURES: tuple[str, ...] = (
     "sp500_log_ret",
     "diff_DFII10",
     "d_gold_copper",
+    "gold_egarch_vol",   
+    "sp500_egarch_vol",   
 )
 
 
@@ -517,23 +520,52 @@ def plot_hmm_gold_states_scatter(
     model: GaussianHMM,
     *,
     title: str = "Gold Market Regime Identification via HMM (2006-2026)",
+    crisis_events_path: str | None = None,
 ) -> None:
     dm = df_model.copy()
     dm["Date"] = pd.to_datetime(dm["Date"])
-    plt.figure(figsize=(15, 5))
+
+    fig, ax = plt.subplots(figsize=(15, 5))
     for i in range(model.n_components):
         state_data = dm[dm["state"] == i]
-        plt.scatter(
+        ax.scatter(
             state_data["Date"],
             state_data["gold_log_ret"],
             label=f"State {i}",
             s=10,
+            zorder=3,
         )
-    plt.title(title, fontsize=14, fontweight="bold")
-    plt.ylabel(r"Daily Log-Returns ($r_{gold,t}$)", fontsize=12)
-    plt.xlabel("Date / Market Timeline", fontsize=12)
-    plt.legend(loc="upper right")
-    ax = plt.gca()
+
+    if crisis_events_path is not None:
+        crisis_df = pd.read_csv(crisis_events_path)
+        crisis_df["Start Date"] = pd.to_datetime(crisis_df["Start Date"], dayfirst=True)
+        crisis_df["End Date"] = pd.to_datetime(crisis_df["End Date"], dayfirst=True)
+
+        cmap = plt.get_cmap("tab10")
+        y_min, y_max = ax.get_ylim()
+        label_y_positions = np.linspace(y_max * 0.82, y_max * 0.55, len(crisis_df))
+
+        for idx, (_, row) in enumerate(crisis_df.iterrows()):
+            color = cmap(idx % 10)
+            ax.axvspan(row["Start Date"], row["End Date"], alpha=0.18, color=color, zorder=1)
+            mid_date = row["Start Date"] + (row["End Date"] - row["Start Date"]) / 2
+            ax.text(
+                mid_date,
+                label_y_positions[idx],
+                row["Abbreviation"],
+                ha="center",
+                va="center",
+                fontsize=10,
+                fontweight="bold",
+                color=color,
+                rotation=0,
+                zorder=4,
+            )
+
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_ylabel(r"Daily Log-Returns ($r_{gold,t}$)", fontsize=12)
+    ax.set_xlabel("Date / Market Timeline", fontsize=12)
+    ax.legend(loc="upper right")
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     plt.xticks(rotation=45)
@@ -590,11 +622,24 @@ def walk_forward_hmm_oos(
     return pd.DataFrame({"Date": oos_dates, "OOS_State": oos_states})
 
 
-def merge_oos_with_returns(df_oos: pd.DataFrame, df_model: pd.DataFrame) -> pd.DataFrame:
-    return df_oos.merge(
+def merge_oos_with_returns(
+    df_oos: pd.DataFrame,
+    df_model: pd.DataFrame,
+    vix_path: str | Path | None = None,
+) -> pd.DataFrame:
+    out = df_oos.merge(
         df_model[["Date", "gold_log_ret", "sp500_log_ret"]],
         on="Date",
     )
+    out["Date"] = pd.to_datetime(out["Date"])
+    if vix_path is None:
+        vix_path = DATA_RAW_DIR / "vix.csv"
+    vix = pd.read_csv(vix_path, parse_dates=["Date"])[["Date", "Close"]].rename(
+        columns={"Close": "vix"}
+    )
+    out = out.merge(vix, on="Date", how="left")
+    out["vix"] = out["vix"].ffill()
+    return out
 
 
 def print_oos_summary(df_oos: pd.DataFrame) -> None:
@@ -611,7 +656,7 @@ def print_oos_summary(df_oos: pd.DataFrame) -> None:
         print(f"OOS state {state} correlation: {corr:.4f}")
 
 
-def add_regime_strategy_returns(df_oos: pd.DataFrame) -> pd.DataFrame:
+def add_regime_strategy_returns(df_oos: pd.DataFrame, vix_threshold: float = 30.0) -> pd.DataFrame:
     out = df_oos.copy()
     out["strategy_ret"] = np.where(
         out["OOS_State"] == 0,
@@ -620,6 +665,14 @@ def add_regime_strategy_returns(df_oos: pd.DataFrame) -> pd.DataFrame:
     )
     out["cum_strategy"] = (1 + out["strategy_ret"]).cumprod()
     out["cum_sp500"] = (1 + out["sp500_log_ret"]).cumprod()
+    if "vix" in out.columns:
+        # use previous day's VIX to determine today's position (avoid look-ahead bias)
+        out["vix30_ret"] = np.where(
+            out["vix"].shift(1) < vix_threshold,
+            out["sp500_log_ret"],
+            out["gold_log_ret"],
+        )
+        out["cum_vix30"] = (1 + out["vix30_ret"]).cumprod()
     return out
 
 
@@ -632,7 +685,209 @@ def plot_strategy_vs_buyhold(
     d = df_oos.copy()
     d["Date"] = pd.to_datetime(d["Date"])
     d = d.set_index("Date")
-    d[["cum_strategy", "cum_sp500"]].plot(figsize=figsize)
-    plt.title(title)
-    plt.tight_layout()
+
+    fig, ax = plt.subplots(figsize=figsize)
+    cols = ["cum_strategy", "cum_sp500"]
+    if "cum_vix30" in d.columns:
+        cols.append("cum_vix30")
+    d[cols].rename(columns={
+        "cum_strategy": "HMM Strategy",
+        "cum_sp500": "S&P 500 Buy-and-Hold",
+        "cum_vix30": "VIX<30 Strategy",
+    }).plot(ax=ax)
+
+    # shade state 1 (bear/stress) regions in light red, state 0 in light blue
+    state_series = d["OOS_State"]
+    dates = state_series.index
+    in_state: int | None = None
+    seg_start = dates[0]
+    for i, (dt, s) in enumerate(state_series.items()):
+        if in_state is None:
+            in_state = s
+            seg_start = dt
+        elif s != in_state or i == len(dates) - 1:
+            color = "#a8d5f5" if in_state == 0 else "#f5a8a8"
+            ax.axvspan(seg_start, dt, alpha=0.5, color=color, linewidth=0)
+            in_state = s
+            seg_start = dt
+
+    from matplotlib.patches import Patch
+    legend_patches = [
+        Patch(facecolor="#a8d5f5", alpha=0.65, label="State 0 (bull)"),
+        Patch(facecolor="#f5a8a8", alpha=0.65, label="State 1 (bear/stress)"),
+    ]
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles + legend_patches, labels + [p.get_label() for p in legend_patches])
+
+    ax.set_title(title)
+    fig.tight_layout()
     plt.show()
+def walk_forward_sticky_hmm_oos(
+    X: np.ndarray,
+    df_model: pd.DataFrame,
+    *,
+    n_train: int = 252 * 5,
+    step: int = 22,
+    n_components: int = 2,
+    covariance_type: str = "full",
+    n_iter: int = 1000,
+    random_state: int | None = 0,
+    p_stay: float = 0.97,
+) -> pd.DataFrame:
+    """Walk-forward OOS HMM with sticky transition prior and cross-window state alignment.
+
+    The sticky prior initialises the transition matrix with *p_stay* on the diagonal
+    so that the EM algorithm starts from a position that disfavours rapid regime
+    switching.  State labels are aligned across windows so that state 0 always
+    corresponds to the bull (lower-volatility) regime identified in the first window.
+
+    Parameters
+    ----------
+    p_stay:
+        Probability of staying in the same state (diagonal of the initial
+        transition matrix).  Higher values produce fewer regime switches.
+        Typical range: 0.95 – 0.99.
+    """
+    n_total = len(X)
+    oos_states: list[int] = []
+    oos_dates: list = []
+    ref_means: np.ndarray | None = None
+
+    p_switch = (1.0 - p_stay) / (n_components - 1)
+    transmat_prior = np.full((n_components, n_components), p_switch)
+    np.fill_diagonal(transmat_prior, p_stay)
+
+    for i in range(n_train, n_total, step):
+        X_train = X[:i]
+        test_end = min(i + step, n_total)
+        X_test = X[i:test_end]
+
+        kw: dict = dict(
+            n_components=n_components,
+            covariance_type=covariance_type,
+            n_iter=n_iter,
+            params="stmc",      # EM updates all parameters
+            init_params="smc",  # do NOT randomly reinitialise transmat
+        )
+        if random_state is not None:
+            kw["random_state"] = random_state
+
+        wf_model = GaussianHMM(**kw)
+        wf_model.transmat_ = transmat_prior.copy()
+        wf_model.fit(X_train)
+
+        current_oos_states = wf_model.predict(X_test)
+
+        # ---- cross-window state-label alignment ----
+        if ref_means is None:
+            ref_means = wf_model.means_.copy()
+        else:
+            d_same = np.linalg.norm(wf_model.means_[0] - ref_means[0])
+            d_swap = np.linalg.norm(wf_model.means_[0] - ref_means[1])
+            if d_swap < d_same:
+                current_oos_states = 1 - current_oos_states
+
+        oos_states.extend(current_oos_states.tolist())
+        oos_dates.extend(df_model.iloc[i:test_end]["Date"].tolist())
+
+    return pd.DataFrame({"Date": oos_dates, "OOS_State": oos_states})
+
+
+def plot_sticky_vs_standard_comparison(
+    df_std: pd.DataFrame,
+    df_sticky: pd.DataFrame,
+    *,
+    figsize: tuple[float, float] = (14, 10),
+    title: str = "Sticky HMM vs Standard HMM: Regime Smoothing Comparison",
+) -> None:
+    """Three-panel comparison: cumulative returns, standard HMM states, sticky HMM states.
+
+    Parameters
+    ----------
+    df_std:
+        OOS dataframe from ``walk_forward_hmm_oos`` with strategy columns added.
+    df_sticky:
+        OOS dataframe from ``walk_forward_sticky_hmm_oos`` with strategy columns added.
+    """
+    import matplotlib.gridspec as gridspec
+    from matplotlib.patches import Patch
+
+    def _count_switches(states: pd.Series) -> int:
+        return int((states.diff().abs() > 0).sum())
+
+    std = df_std.copy()
+    sty = df_sticky.copy()
+    std["Date"] = pd.to_datetime(std["Date"])
+    sty["Date"] = pd.to_datetime(sty["Date"])
+    std = std.set_index("Date")
+    sty = sty.set_index("Date")
+
+    n_sw_std = _count_switches(std["OOS_State"])
+    n_sw_sty = _count_switches(sty["OOS_State"])
+
+    fig = plt.figure(figsize=figsize)
+    fig.suptitle(title, fontsize=13, fontweight="bold", y=0.98)
+
+    gs = gridspec.GridSpec(3, 1, figure=fig, height_ratios=[3, 1, 1], hspace=0.08)
+    ax_ret   = fig.add_subplot(gs[0])
+    ax_std   = fig.add_subplot(gs[1], sharex=ax_ret)
+    ax_sty   = fig.add_subplot(gs[2], sharex=ax_ret)
+
+    # ---- cumulative return panel ----
+    plot_cols = []
+    labels    = []
+    if "cum_strategy" in std.columns:
+        ax_ret.plot(std.index, std["cum_strategy"], color="steelblue",  lw=1.5, label=f"Standard HMM (switches={n_sw_std})")
+    if "cum_strategy" in sty.columns:
+        ax_ret.plot(sty.index, sty["cum_strategy"], color="darkorange", lw=1.5, label=f"Sticky HMM  (switches={n_sw_sty})", linestyle="--")
+    if "cum_sp500" in std.columns:
+        ax_ret.plot(std.index, std["cum_sp500"],    color="grey",       lw=1.2, label="S&P 500 B&H", alpha=0.75)
+
+    ax_ret.set_ylabel("Cumulative Return", fontsize=10)
+    ax_ret.legend(loc="upper left", fontsize=9)
+    ax_ret.grid(True, alpha=0.3)
+    plt.setp(ax_ret.get_xticklabels(), visible=False)
+
+    # ---- state-sequence panels ----
+    def _shade_states(ax: plt.Axes, state_series: pd.Series, panel_label: str, n_sw: int) -> None:
+        dates = state_series.index
+        in_state: int | None = None
+        seg_start = dates[0]
+        for idx, (dt, s) in enumerate(state_series.items()):
+            if in_state is None:
+                in_state = s
+                seg_start = dt
+            elif s != in_state or idx == len(dates) - 1:
+                color = "#a8d5f5" if in_state == 0 else "#f5a8a8"
+                ax.axvspan(seg_start, dt, alpha=0.8, color=color, linewidth=0)
+                in_state = s
+                seg_start = dt
+        ax.set_yticks([])
+        ax.set_ylabel(f"{panel_label}\n(switches={n_sw})", fontsize=9)
+        ax.grid(False)
+
+    _shade_states(ax_std, std["OOS_State"], "Standard\nHMM", n_sw_std)
+    _shade_states(ax_sty, sty["OOS_State"], "Sticky\nHMM",   n_sw_sty)
+
+    legend_patches = [
+        Patch(facecolor="#a8d5f5", alpha=0.9, label="State 0 (bull)"),
+        Patch(facecolor="#f5a8a8", alpha=0.9, label="State 1 (bear/stress)"),
+    ]
+    ax_sty.legend(handles=legend_patches, loc="lower left", fontsize=8, ncol=2)
+
+    ax_sty.set_xlabel("Date", fontsize=10)
+    ax_sty.xaxis.set_major_locator(mdates.YearLocator())
+    ax_sty.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    plt.setp(ax_sty.get_xticklabels(), rotation=45, ha="right")
+
+    fig.tight_layout()
+    plt.show()
+
+
+def _fit_egarch_vol(returns: pd.Series) -> pd.Series:
+    """Fit EGARCH(1,1,1) and return annualised conditional volatility."""
+    clean = returns.dropna()
+    model = arch_model(clean * 100, vol="EGARCH", p=1, o=1, q=1, dist="normal")
+    res = model.fit(disp="off", show_warning=False)
+    vol = res.conditional_volatility / 100          # back to decimal scale
+    return vol.reindex(returns.index)               # NaN where returns were NaN
